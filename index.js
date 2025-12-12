@@ -11,7 +11,7 @@ const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL; // URL Web App GAS (/exec)
 
 /* ====== KONFIG DOMAIN/PROXY/UA ====== */
 const DOMAINS_MAP = {
-  tw: "https://penidadivecenter.tw",
+  tw: "https://divinglembongan.tw",
 };
 
 const PROXIES = {
@@ -20,7 +20,7 @@ const PROXIES = {
 
 // UA browser-like agar tidak mudah diblokir WAF/CDN
 const USER_AGENTS = {
-  tw: "PenidaDiveCenter - CacheWarmer - TW / 1.0"
+  tw: "DivingLembongan - CacheWarmer - TW / 1.0",
 };
 
 /* ====== CLOUDFLARE (opsional) ====== */
@@ -288,16 +288,24 @@ async function warmUrls(urls, country, logger, batchSize = 1, delay = 2000) {
           const cfCache = res.headers["cf-cache-status"] || "N/A";
           const lsCache = res.headers["x-litespeed-cache"] || "N/A";
           const cfRay = res.headers["cf-ray"] || "N/A";
-          const cfEdge =
-            cfRay && cfRay.includes("-") ? cfRay.split("-")[1] : "N/A";
+
+          // Ambil CF edge PoP dari cf-ray — gunakan segmen terakhir setelah '-' (lebih robust)
+          let cfEdge = "N/A";
+          if (typeof cfRay === "string" && cfRay.includes("-")) {
+            const parts = cfRay.split("-");
+            cfEdge = parts[parts.length - 1] || "N/A";
+          }
+
+          // Gunakan cfEdge sebagai country jika tersedia, kalau tidak fallback ke label country
+          const countryTag = cfEdge && cfEdge !== "N/A" ? cfEdge : country;
 
           console.log(
-            `[${country}] ${res.status} cf=${cfCache} ls=${lsCache} edge=${cfEdge} - ${url}`
+            `[${countryTag}] ${res.status} cf=${cfCache} ls=${lsCache} edge=${cfEdge} - ${url}`
           );
 
           // Kumpulkan log (dikirim sekali di akhir run)
           logger.log({
-            country,
+            country: countryTag, // <-- pake CF edge di sini
             url,
             status: res.status,
             cfCache,
@@ -318,8 +326,9 @@ async function warmUrls(urls, country, logger, batchSize = 1, delay = 2000) {
             `[${country}] ❌ Failed to warm ${url}: ${err?.message || err}`
           );
 
+          // untuk error juga simpan countryTag (tetap fallback ke label jika tidak ada cf-ray)
           logger.log({
-            country,
+            country: country, // pada error kita tidak bisa mengambil header → tetap label
             url,
             responseMs: dt,
             error: 1,
