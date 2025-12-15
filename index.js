@@ -38,7 +38,9 @@ function extractCfEdge(cfRay) {
 class AppsScriptLogger {
   constructor() {
     this.rows = [];
+    this.runId = Math.random().toString(36).slice(2) + Date.now().toString(36);
     this.startedAt = new Date().toISOString();
+    this.finishedAt = null;
   }
 
   log({
@@ -53,17 +55,28 @@ class AppsScriptLogger {
     message = "",
   }) {
     this.rows.push([
-      this.startedAt,
+      this.runId, // run_id
+      this.startedAt, // started_at
+      this.finishedAt, // finished_at (diisi nanti)
       country,
       url,
       status,
       cfCache,
       lsCache,
       cfRay,
-      responseMs,
+      typeof responseMs === "number" ? responseMs : "",
       error ? 1 : 0,
       message,
     ]);
+  }
+
+  setFinished() {
+    this.finishedAt = new Date().toISOString();
+    // backfill finished_at untuk semua row
+    this.rows = this.rows.map((r) => {
+      r[2] = this.finishedAt;
+      return r;
+    });
   }
 
   async flush() {
@@ -74,13 +87,17 @@ class AppsScriptLogger {
     await axios.post(
       APPS_SCRIPT_URL,
       { rows: this.rows },
-      { headers: { "Content-Type": "application/json" }, timeout: 20000 }
+      {
+        headers: { "Content-Type": "application/json" },
+        timeout: 20000,
+      }
     );
 
     console.log("✅ GSheets log sent");
     this.rows = [];
   }
 }
+
 
 /* ================= HTTP (ASIA-ANCHORED) ================= */
 function createAsiaAgent(country) {
