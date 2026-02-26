@@ -1,4 +1,3 @@
-// cachewarmer_tw_gsheets.js
 import axios from "axios";
 import { HttpsProxyAgent } from "https-proxy-agent";
 import { parseStringPromise } from "xml2js";
@@ -6,12 +5,10 @@ import * as dotenv from "dotenv";
 
 dotenv.config();
 
-/* ================= ENV ================= */
-const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL;
-const CLOUDFLARE_ZONE_ID = process.env.CLOUDFLARE_ZONE_ID;
-const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
+/* ====== ENV WAJIB ====== */
+const APPS_SCRIPT_URL = process.env.APPS_SCRIPT_URL; // URL Web App GAS /exec
 
-/* ================= DOMAIN / PROXY / UA ================= */
+/* ====== KONFIG DOMAIN/PROXY/UA ====== */
 const DOMAINS_MAP = {
   tw: "https://divinglembongan.tw",
 };
@@ -24,23 +21,34 @@ const USER_AGENTS = {
   tw: "DivingLembongan-TW-CacheWarmer/1.0",
 };
 
-/* ================= UTIL ================= */
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+/* ====== CLOUDFLARE (opsional) ====== */
+const CLOUDFLARE_ZONE_ID = process.env.CLOUDFLARE_ZONE_ID;
+const CLOUDFLARE_API_TOKEN = process.env.CLOUDFLARE_API_TOKEN;
 
-function extractCfEdge(cfRay) {
-  if (typeof cfRay === "string" && cfRay.includes("-")) {
-    return cfRay.split("-").pop();
-  }
-  return "N/A";
+/* ====== UTIL ====== */
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const cryptoRandomId = () =>
+  Math.random().toString(36).slice(2) + Date.now().toString(36);
+
+/** Nama tab per-run: YYYY-MM-DD_HH-mm-ss_WITA (tanpa +0800) */
+function makeSheetNameForRun(date = new Date()) {
+  const pad = (n) => String(n).padStart(2, "0");
+  const local = new Date(date.getTime() + 8 * 3600 * 1000); // WITA +08
+  return `${local.getUTCFullYear()}-${pad(local.getUTCMonth() + 1)}-${pad(
+    local.getUTCDate()
+  )}_${pad(local.getUTCHours())}-${pad(local.getUTCMinutes())}-${pad(
+    local.getUTCSeconds()
+  )}_WITA`;
 }
 
-/* ================= LOGGER → GSHEETS ================= */
+/* ====== LOGGER → APPS SCRIPT (BATCH PER-RUN) ====== */
 class AppsScriptLogger {
   constructor() {
     this.rows = [];
-    this.runId = Math.random().toString(36).slice(2) + Date.now().toString(36);
+    this.runId = cryptoRandomId();
     this.startedAt = new Date().toISOString();
     this.finishedAt = null;
+    this.sheetName = makeSheetNameForRun(); // satu tab per-run
   }
 
   log({
@@ -56,128 +64,166 @@ class AppsScriptLogger {
   }) {
     this.rows.push([
       this.runId, // run_id
-      this.startedAt, // started_at
-      this.finishedAt, // finished_at (diisi nanti)
-      country,
-      url,
-      status,
-      cfCache,
-      lsCache,
-      cfRay,
-      typeof responseMs === "number" ? responseMs : "",
-      error ? 1 : 0,
-      message,
+      this.startedAt, // started_at (ISO)
+      this.finishedAt, // finished_at (diisi saat finalize)
+      country, // country
+      url, // url
+      status, // status code
+      cfCache, // cf_cache
+      lsCache, // litespeed_cache
+      cfRay, // cf_ray
+      typeof responseMs === "number" ? responseMs : "", // response_ms
+      error ? 1 : 0, // error (0/1)
+      message, // message
     ]);
   }
 
   setFinished() {
     this.finishedAt = new Date().toISOString();
-    // backfill finished_at untuk semua row
-    this.rows = this.rows.map((r) => {
-      r[2] = this.finishedAt;
-      return r;
-    });
+    this.rows = this.rows.map((r) => ((r[2] = this.finishedAt), r));
   }
 
   async flush() {
-    if (!APPS_SCRIPT_URL || this.rows.length === 0) return;
+    if (!APPS_SCRIPT_URL) {
+      console.warn("Apps Script logging disabled (missing APPS_SCRIPT_URL).");
+      return;
+    }
+    if (this.rows.length === 0) return;
 
-    console.log(`📝 Logging ${this.rows.length} rows to GSheets…`);
-
-    await axios.post(
-      APPS_SCRIPT_URL,
-      { rows: this.rows },
-      {
-        headers: { "Content-Type": "application/json" },
-        timeout: 20000,
-      }
-    );
-
-    console.log("✅ GSheets log sent");
-    this.rows = [];
+    try {
+      const res = await axios.post(
+        APPS_SCRIPT_URL,
+        { sheetName: this.sheetName, rows: this.rows },
+        { timeout: 20000, headers: { "Content-Type": "application/json" } }
+      );
+      console.log("Apps Script response:", res.status, res.data);
+      if (!res.data?.ok) console.warn("Apps Script replied error:", res.data);
+      this.rows = []; // bersihkan buffer
+    } catch (e) {
+      console.warn(
+        "Apps Script logging error:",
+        e?.response?.status,
+        e?.response?.data || e?.message || e
+      );
+    }
   }
 }
 
-
-/* ================= HTTP (ASIA-ANCHORED) ================= */
-function createAsiaAgent(country) {
+/* ====== HTTP helper (dgn/tnp proxy) ====== */
+function buildAxiosCfg(country, extra = {}) {
   const proxy = PROXIES[country];
-  if (!proxy) throw new Error(`Missing proxy for ${country}`);
-  return new HttpsProxyAgent(proxy);
+  const cfg = {
+    headers: { "User-Agent": USER_AGENTS[country] },
+    timeout: 30000,
+    ...extra,
+  };
+  if (proxy) cfg.httpsAgent = new HttpsProxyAgent(proxy);
+  return cfg;
 }
 
-async function fetchWithProxy(url, agent, country, timeout = 15000) {
-  const res = await axios.get(url, {
-    httpsAgent: agent,
-    timeout,
-    headers: {
-      "User-Agent": USER_AGENTS[country],
-      Accept: "application/xml,text/xml;q=0.9,*/*;q=0.8",
-      "Accept-Language": "zh-TW,zh;q=0.9,en;q=0.8",
-    },
-  });
+/* ====== SITEMAP ====== */
+async function fetchWithProxy(url, country, timeout = 15000) {
+  const cfg = buildAxiosCfg(country, { timeout });
+  const res = await axios.get(url, cfg);
   return res.data;
 }
 
-/* ================= SITEMAP ================= */
-async function fetchIndexSitemaps(domain, agent, country) {
+async function fetchIndexSitemaps(domain, country) {
   try {
-    const xml = await fetchWithProxy(`${domain}/sitemap.xml`, agent, country);
-    const parsed = await parseStringPromise(xml, {
+    const xml = await fetchWithProxy(
+      `${domain}/sitemap.xml`,
+      country,
+      15000
+    );
+    const result = await parseStringPromise(xml, {
       explicitArray: false,
       ignoreAttrs: true,
     });
-
-    const items = parsed?.sitemapindex?.sitemap;
-    if (!items) return [];
-    return (Array.isArray(items) ? items : [items]).map((i) => i.loc);
-  } catch {
+    const sitemapList = result?.sitemapindex?.sitemap;
+    if (!sitemapList) return [];
+    const sitemaps = Array.isArray(sitemapList) ? sitemapList : [sitemapList];
+    return sitemaps.map((entry) => entry.loc).filter(Boolean);
+  } catch (err) {
+    console.warn(
+      `[${country}] ❌ Failed to fetch sitemap index: ${err?.message || err}`
+    );
     return [];
   }
 }
 
-async function fetchUrlsFromSitemap(sitemapUrl, agent, country) {
+async function fetchUrlsFromSitemap(sitemapUrl, country) {
   try {
-    const xml = await fetchWithProxy(sitemapUrl, agent, country);
-    const parsed = await parseStringPromise(xml, {
+    const xml = await fetchWithProxy(sitemapUrl, country, 15000);
+    const result = await parseStringPromise(xml, {
       explicitArray: false,
       ignoreAttrs: true,
     });
-
-    const urls = parsed?.urlset?.url;
-    if (!urls) return [];
-    return (Array.isArray(urls) ? urls : [urls]).map((u) => u.loc);
-  } catch {
+    const urlList = result?.urlset?.url;
+    if (!urlList) return [];
+    const urls = Array.isArray(urlList) ? urlList : [urlList];
+    return urls.map((entry) => entry.loc).filter(Boolean);
+  } catch (err) {
+    console.warn(
+      `[${country}] ❌ Failed to fetch URLs from ${sitemapUrl}: ${err?.message || err
+      }`
+    );
     return [];
   }
 }
 
-/* ================= CLOUDFLARE ================= */
+/* ====== WARMING ====== */
+async function retryableGet(url, cfg, retries = 3) {
+  let lastError = null;
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await axios.get(url, cfg);
+    } catch (err) {
+      lastError = err;
+      const code = err?.code || "";
+      const status = err?.response?.status;
+
+      // Retry jika network error ATAU server error (502, 503, 504)
+      const isNetworkError =
+        axios.isAxiosError(err) &&
+        ["ECONNABORTED", "ECONNRESET", "ETIMEDOUT"].includes(code);
+      const isServerError = [502, 503, 504].includes(status);
+
+      if (!isNetworkError && !isServerError) break;
+
+      console.log(`  ⟳ Retry ${i + 1}/${retries} for ${url} (${status || code})`);
+      await sleep(3000); // tunggu 3 detik sebelum retry
+    }
+  }
+  throw lastError;
+}
+
 async function purgeCloudflareCache(url) {
   if (!CLOUDFLARE_ZONE_ID || !CLOUDFLARE_API_TOKEN) return;
-
-  await axios.post(
-    `https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache`,
-    { files: [url] },
-    {
-      headers: {
-        Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
-        "Content-Type": "application/json",
-      },
+  try {
+    const purgeRes = await axios.post(
+      `https://api.cloudflare.com/client/v4/zones/${CLOUDFLARE_ZONE_ID}/purge_cache`,
+      { files: [url] },
+      {
+        headers: {
+          Authorization: `Bearer ${CLOUDFLARE_API_TOKEN}`,
+          "Content-Type": "application/json",
+        },
+      }
+    );
+    if (purgeRes.data?.success) {
+      console.log(`✅ Cloudflare cache purged: ${url}`);
+    } else {
+      console.warn(`⚠️ Failed to purge Cloudflare: ${url}`);
     }
-  );
-
-  console.log(`🧹 CF purge triggered: ${url}`);
+  } catch {
+    console.warn(`❌ Error purging Cloudflare: ${url}`);
+  }
 }
 
-/* ================= WARMER (EDGE + ORIGIN) ================= */
-async function warmUrls(urls, agent, country, logger) {
-  const BATCH_SIZE = 3;
-  const DELAY = 7000;
-
+async function warmUrls(urls, country, logger, batchSize = 1, delay = 2000) {
   const batches = Array.from(
-    { length: Math.ceil(urls.length / BATCH_SIZE) },
-    (_, i) => urls.slice(i * BATCH_SIZE, i * BATCH_SIZE + BATCH_SIZE)
+    { length: Math.ceil(urls.length / batchSize) },
+    (_, i) => urls.slice(i * batchSize, i * batchSize + batchSize)
   );
 
   for (const batch of batches) {
@@ -185,28 +231,25 @@ async function warmUrls(urls, agent, country, logger) {
       batch.map(async (url) => {
         const t0 = Date.now();
         try {
-          const res = await axios.get(url, {
-            httpsAgent: agent,
-            timeout: 30000,
-            headers: { "User-Agent": USER_AGENTS[country] },
-          });
-
+          const res = await retryableGet(
+            url,
+            buildAxiosCfg(country, { timeout: 15000 }),
+            3
+          );
           const dt = Date.now() - t0;
 
-          /* ===== EDGE (Cloudflare) ===== */
           const cfCache = res.headers["cf-cache-status"] || "N/A";
-          const cfRay = res.headers["cf-ray"] || "N/A";
-          const edge = extractCfEdge(cfRay);
-
-          /* ===== ORIGIN (LiteSpeed) ===== */
           const lsCache = res.headers["x-litespeed-cache"] || "N/A";
+          const cfRay = res.headers["cf-ray"] || "N/A";
+          const cfEdge = cfRay.includes("-") ? cfRay.split("-")[1] : "N/A";
 
           console.log(
-            `[${edge}] ${res.status} cf=${cfCache} ls=${lsCache} - ${url}`
+            `[${country}] ${res.status} cf=${cfCache} ls=${lsCache} edge=${cfEdge} - ${url}`
           );
 
+          // Kumpulkan log (TIDAK dikirim sekarang; dikirim sekali di akhir run)
           logger.log({
-            country: edge,
+            country: cfEdge,
             url,
             status: res.status,
             cfCache,
@@ -214,54 +257,68 @@ async function warmUrls(urls, agent, country, logger) {
             cfRay,
             responseMs: dt,
             error: 0,
+            message: "",
           });
 
-          /* ===== EDGE DECISION ===== */
-          if (cfCache !== "HIT") {
+          // Aturan purge: kalau LiteSpeed bukan HIT → purge CF
+          if (String(lsCache).toLowerCase() !== "hit") {
             await purgeCloudflareCache(url);
           }
+        } catch (err) {
+          const dt = Date.now() - t0;
+          console.warn(
+            `[${country}] ❌ Failed to warm ${url}: ${err?.message || err}`
+          );
 
-          /* ===== ORIGIN DECISION (SOFT) ===== */
-          if (String(lsCache).toLowerCase() !== "hit") {
-            await sleep(3000);
-          }
-        } catch (e) {
-          console.warn(`[${country}] ❌ Failed ${url}`);
           logger.log({
             country,
             url,
+            responseMs: dt,
             error: 1,
-            message: e?.message || "request failed",
+            message: err?.message || "request failed",
           });
         }
       })
     );
 
-    await sleep(DELAY);
+    // TIDAK flush di sini → supaya semua baris terkirim SEKALI di akhir ke satu tab
+    await sleep(delay);
   }
 }
 
-/* ================= MAIN ================= */
+/* ====== MAIN (SEQUENTIAL per-country, satu tab) ====== */
 (async () => {
-  console.log(`[CacheWarmer-TW] Started ${new Date().toISOString()}`);
+  console.log(`[CacheWarmer] Started: ${new Date().toISOString()}`);
   const logger = new AppsScriptLogger();
 
   try {
+    // Proses BERURUTAN per-negara (bukan paralel)
     for (const [country, domain] of Object.entries(DOMAINS_MAP)) {
-      const agent = createAsiaAgent(country);
+      console.log(`\n========== [${country.toUpperCase()}] MULAI ==========`);
 
-      const sitemaps = await fetchIndexSitemaps(domain, agent, country);
-      const urls = (
-        await Promise.all(
-          sitemaps.map((s) => fetchUrlsFromSitemap(s, agent, country))
+      const sitemapList = await fetchIndexSitemaps(domain, country);
+      const urlArrays = await Promise.all(
+        sitemapList.map((sitemapUrl) =>
+          fetchUrlsFromSitemap(sitemapUrl, country)
         )
-      ).flat();
+      );
+      const urls = urlArrays.flat().filter(Boolean);
 
       console.log(`[${country}] Found ${urls.length} URLs`);
-      await warmUrls(urls, agent, country, logger);
+      logger.log({
+        country,
+        message: `Found ${urls.length} URLs for ${country}`,
+      });
+
+      await warmUrls(urls, country, logger);
+
+      console.log(`========== [${country.toUpperCase()}] SELESAI ==========\n`);
     }
   } finally {
+    // Kirim SEKALI di akhir → semua baris tersimpan dalam SATU tab (sheetName per-run)
+    logger.setFinished();
     await logger.flush();
-    console.log(`[CacheWarmer-TW] Finished`);
   }
+
+  console.log(`[CacheWarmer] Finished: ${new Date().toISOString()}`);
 })();
